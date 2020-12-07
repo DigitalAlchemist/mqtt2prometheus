@@ -4,13 +4,14 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
 	"net/http"
 	"os"
 	"time"
 
-	"github.com/eclipse/paho.mqtt.golang"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/hikhvar/mqtt2prometheus/pkg/config"
 	"github.com/hikhvar/mqtt2prometheus/pkg/metrics"
 	"github.com/hikhvar/mqtt2prometheus/pkg/mqttclient"

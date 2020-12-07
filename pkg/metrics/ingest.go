@@ -2,13 +2,14 @@ package metrics
 
 import (
 	"fmt"
-	"go.uber.org/zap"
 	"strconv"
 	"time"
 
-	gojsonq "github.com/thedevsaddam/gojsonq/v2"
+	"go.uber.org/zap"
 
-	"github.com/eclipse/paho.mqtt.golang"
+	"github.com/tidwall/gjson"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/hikhvar/mqtt2prometheus/pkg/config"
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -55,27 +56,35 @@ func (i *Ingest) validMetric(metric string, deviceID string) (config.MetricConfi
 func (i *Ingest) store(topic string, payload []byte) error {
 	var mc MetricCollection
 	deviceID := i.deviceID(topic)
-	parsed := gojsonq.New().FromString(string(payload))
+	mci, found := i.collector.(*MemoryCachedCollector).cache.Get(deviceID)
+	if found {
+		mc = mci.(MetricCollection)
+	} else {
+		mc = make(MetricCollection, 0)
+	}
+
+	json := string(payload)
 
 	for path := range i.metricConfigs {
-		rawValue := parsed.Find(path)
-		parsed.Reset()
-		if rawValue == nil {
+		result := gjson.Get(json, path)
+		if result.Type == gjson.Null {
+			i.logger.Debug("Invalid path", zap.String("path", path), zap.String("payload", string(payload)))
 			continue
 		}
-		m, err := i.parseMetric(path, deviceID, rawValue)
+		m, err := i.parseMetric(path, deviceID, &result)
 		if err != nil {
+			i.logger.Debug("Error parsing metric", zap.String("err", err.Error()))
 			return fmt.Errorf("failed to parse valid metric value: %w", err)
 		}
 		m.Topic = topic
-		mc = append(mc, m)
+		mc[path] = m
 	}
 
 	i.collector.Observe(deviceID, mc)
 	return nil
 }
 
-func (i *Ingest) parseMetric(metricPath string, deviceID string, value interface{}) (Metric, error) {
+func (i *Ingest) parseMetric(metricPath string, deviceID string, value *gjson.Result) (Metric, error) {
 	cfg, cfgFound := i.validMetric(metricPath, deviceID)
 	if !cfgFound {
 		return Metric{}, nil
@@ -83,14 +92,15 @@ func (i *Ingest) parseMetric(metricPath string, deviceID string, value interface
 
 	var metricValue float64
 
-	if boolValue, ok := value.(bool); ok {
-		if boolValue {
+	switch value.Type {
+	case gjson.True, gjson.False:
+		if value.Bool() {
 			metricValue = 1
 		} else {
 			metricValue = 0
 		}
-	} else if strValue, ok := value.(string); ok {
-
+	case gjson.String:
+		strValue := value.String()
 		// If string value mapping is defined, use that
 		if cfg.StringValueMapping != nil {
 
@@ -111,14 +121,15 @@ func (i *Ingest) parseMetric(metricPath string, deviceID string, value interface
 				return Metric{}, fmt.Errorf("got data with unexpectd type: %T ('%s') and failed to parse to float", value, value)
 			}
 			metricValue = floatValue
-
 		}
-
-	} else if floatValue, ok := value.(float64); ok {
-		metricValue = floatValue
-	} else {
+	case gjson.Number:
+		metricValue = value.Float()
+	default:
 		return Metric{}, fmt.Errorf("got data with unexpectd type: %T ('%s')", value, value)
 	}
+
+	i.logger.Debug("Storing metric", zap.String("path", metricPath), zap.String("deviceID", deviceID), zap.Float64("value", metricValue))
+
 	return Metric{
 		Description: cfg.PrometheusDescription(),
 		Value:       metricValue,

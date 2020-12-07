@@ -28,7 +28,7 @@ type Metric struct {
 	Topic       string
 }
 
-type MetricCollection []Metric
+type MetricCollection map[string]Metric
 
 func NewCollector(defaultTimeout time.Duration, possibleMetrics []config.MetricConfig) Collector {
 	var descs []*prometheus.Desc
