@@ -15,15 +15,15 @@ import (
 )
 
 type Ingest struct {
-	metricConfigs map[string][]config.MetricConfig
+	metricConfigs map[string][]*config.MetricConfig
 	deviceIDRegex *config.Regexp
 	collector     Collector
 	MessageMetric *prometheus.CounterVec
 	logger        *zap.Logger
 }
 
-func NewIngest(collector Collector, metrics []config.MetricConfig, deviceIDRegex *config.Regexp) *Ingest {
-	cfgs := make(map[string][]config.MetricConfig)
+func NewIngest(collector Collector, metrics []*config.MetricConfig, deviceIDRegex *config.Regexp) *Ingest {
+	cfgs := make(map[string][]*config.MetricConfig)
 	for i := range metrics {
 		key := metrics[i].MQTTName
 		cfgs[key] = append(cfgs[key], metrics[i])
@@ -44,18 +44,23 @@ func NewIngest(collector Collector, metrics []config.MetricConfig, deviceIDRegex
 
 // validMetric returns config matching the metric and deviceID
 // Second return value indicates if config was found.
-func (i *Ingest) validMetric(metric string, deviceID string) (config.MetricConfig, bool) {
+func (i *Ingest) validMetric(metric string, deviceID string) *config.MetricConfig {
 	for _, c := range i.metricConfigs[metric] {
 		if c.SensorNameFilter.Match(deviceID) {
-			return c, true
+			return c
 		}
 	}
-	return config.MetricConfig{}, false
+	return nil
 }
 
 func (i *Ingest) store(topic string, payload []byte) error {
+
 	var mc MetricCollection
+	var metricValue float64
+
 	deviceID := i.deviceID(topic)
+
+	// Check if this metric already exists so we can update it.
 	mci, found := i.collector.(*MemoryCachedCollector).cache.Get(deviceID)
 	if found {
 		mc = mci.(MetricCollection)
@@ -64,78 +69,87 @@ func (i *Ingest) store(topic string, payload []byte) error {
 	}
 
 	json := string(payload)
-
 	for path := range i.metricConfigs {
-		result := gjson.Get(json, path)
-		if result.Type == gjson.Null {
-			i.logger.Debug("Invalid path", zap.String("path", path), zap.String("payload", string(payload)))
+
+		cfg := i.validMetric(path, deviceID)
+		if cfg == nil || !cfg.SensorNameFilter.Match(deviceID) {
+			i.logger.Debug("Invalid metric", zap.String("path", path), zap.String("deviceID", deviceID))
 			continue
 		}
-		m, err := i.parseMetric(path, deviceID, &result)
-		if err != nil {
-			i.logger.Debug("Error parsing metric", zap.String("err", err.Error()))
-			return fmt.Errorf("failed to parse valid metric value: %w", err)
+
+		result := gjson.Get(json, path)
+		switch result.Type {
+		default:
+			fallthrough
+		case gjson.Null:
+			i.logger.Debug("Invalid path", zap.String("path", path), zap.String("payload", string(payload)))
+			continue
+		case gjson.True, gjson.False:
+			if result.Bool() {
+				metricValue = 1
+			} else {
+				metricValue = 0
+			}
+		case gjson.String:
+			strValue := result.String()
+			// If string value mapping is defined, use that
+			if cfg.StringValueMapping != nil {
+
+				floatValue, ok := cfg.StringValueMapping.Map[strValue]
+				if ok {
+					metricValue = floatValue
+				} else if cfg.StringValueMapping.ErrorValue != nil {
+					metricValue = *cfg.StringValueMapping.ErrorValue
+				} else {
+					i.logger.Debug("got unexpected string data", zap.String("value", strValue))
+					continue
+				}
+
+			} else {
+				// otherwise try to parse float
+				floatValue, err := strconv.ParseFloat(strValue, 64)
+				if err != nil {
+					i.logger.Debug("got data with unexpected type", zap.String("value", result.String()))
+					continue
+				}
+				metricValue = floatValue
+			}
+		case gjson.Number:
+			metricValue = result.Float()
 		}
-		m.Topic = topic
-		mc[path] = m
+
+		keys := make([]string, 0)
+		labels := make([]string, 0)
+		for _, pL := range cfg.PromLabels {
+			if mL, ok := cfg.VariableLabels[pL]; ok {
+				result := gjson.Get(json, mL)
+				if result.Type == gjson.Null {
+					continue
+				}
+				keys = append(keys, pL)
+				labels = append(labels, result.String())
+			} else if pL == "topic" {
+				keys = append(keys, pL)
+				labels = append(labels, topic)
+			} else if pL == "sensor" {
+				keys = append(keys, pL)
+				labels = append(labels, deviceID)
+			}
+		}
+
+		metric := Metric{
+			Description: cfg.PrometheusDescription(keys),
+			Value:       metricValue,
+			ValueType:   cfg.PrometheusValueType(),
+			IngestTime:  time.Now(),
+			Labels:      labels,
+		}
+
+		mc[path] = metric
 	}
 
 	i.collector.Observe(deviceID, mc)
 	return nil
-}
-
-func (i *Ingest) parseMetric(metricPath string, deviceID string, value *gjson.Result) (Metric, error) {
-	cfg, cfgFound := i.validMetric(metricPath, deviceID)
-	if !cfgFound {
-		return Metric{}, nil
-	}
-
-	var metricValue float64
-
-	switch value.Type {
-	case gjson.True, gjson.False:
-		if value.Bool() {
-			metricValue = 1
-		} else {
-			metricValue = 0
-		}
-	case gjson.String:
-		strValue := value.String()
-		// If string value mapping is defined, use that
-		if cfg.StringValueMapping != nil {
-
-			floatValue, ok := cfg.StringValueMapping.Map[strValue]
-			if ok {
-				metricValue = floatValue
-			} else if cfg.StringValueMapping.ErrorValue != nil {
-				metricValue = *cfg.StringValueMapping.ErrorValue
-			} else {
-				return Metric{}, fmt.Errorf("got unexpected string data '%s'", strValue)
-			}
-
-		} else {
-
-			// otherwise try to parse float
-			floatValue, err := strconv.ParseFloat(strValue, 64)
-			if err != nil {
-				return Metric{}, fmt.Errorf("got data with unexpectd type: %T ('%s') and failed to parse to float", value, value)
-			}
-			metricValue = floatValue
-		}
-	case gjson.Number:
-		metricValue = value.Float()
-	default:
-		return Metric{}, fmt.Errorf("got data with unexpectd type: %T ('%s')", value, value)
-	}
-
-	i.logger.Debug("Storing metric", zap.String("path", metricPath), zap.String("deviceID", deviceID), zap.Float64("value", metricValue))
-
-	return Metric{
-		Description: cfg.PrometheusDescription(),
-		Value:       metricValue,
-		ValueType:   cfg.PrometheusValueType(),
-		IngestTime:  time.Now(),
-	}, nil
 }
 
 func (i *Ingest) SetupSubscriptionHandler(errChan chan<- error) mqtt.MessageHandler {

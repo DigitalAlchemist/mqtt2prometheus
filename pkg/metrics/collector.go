@@ -25,19 +25,14 @@ type Metric struct {
 	Value       float64
 	ValueType   prometheus.ValueType
 	IngestTime  time.Time
-	Topic       string
+	Labels      []string
 }
 
 type MetricCollection map[string]Metric
 
-func NewCollector(defaultTimeout time.Duration, possibleMetrics []config.MetricConfig) Collector {
-	var descs []*prometheus.Desc
-	for _, m := range possibleMetrics {
-		descs = append(descs, m.PrometheusDescription())
-	}
+func NewCollector(defaultTimeout time.Duration, possibleMetrics []*config.MetricConfig) Collector {
 	return &MemoryCachedCollector{
-		cache:        gocache.New(defaultTimeout, defaultTimeout*10),
-		descriptions: descs,
+		cache: gocache.New(defaultTimeout, defaultTimeout*10),
 	}
 }
 
@@ -45,22 +40,17 @@ func (c *MemoryCachedCollector) Observe(deviceID string, collection MetricCollec
 	c.cache.Set(deviceID, collection, DefaultTimeout)
 }
 
-func (c *MemoryCachedCollector) Describe(ch chan<- *prometheus.Desc) {
-	for i := range c.descriptions {
-		ch <- c.descriptions[i]
-	}
-}
+func (c *MemoryCachedCollector) Describe(ch chan<- *prometheus.Desc) {}
 
 func (c *MemoryCachedCollector) Collect(mc chan<- prometheus.Metric) {
-	for device, metricsRaw := range c.cache.Items() {
+	for _, metricsRaw := range c.cache.Items() {
 		metrics := metricsRaw.Object.(MetricCollection)
 		for _, metric := range metrics {
 			m := prometheus.MustNewConstMetric(
 				metric.Description,
 				metric.ValueType,
 				metric.Value,
-				device,
-				metric.Topic,
+				metric.Labels...,
 			)
 			mc <- prometheus.NewMetricWithTimestamp(metric.IngestTime, m)
 		}

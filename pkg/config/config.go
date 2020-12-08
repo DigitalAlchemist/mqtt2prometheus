@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io/ioutil"
 	"regexp"
+	"sort"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -77,9 +78,9 @@ func mustNewRegexp(pattern string) *Regexp {
 }
 
 type Config struct {
-	Metrics []MetricConfig `yaml:"metrics"`
-	MQTT    *MQTTConfig    `yaml:"mqtt,omitempty"`
-	Cache   *CacheConfig   `yaml:"cache,omitempty"`
+	Metrics []*MetricConfig `yaml:"metrics"`
+	MQTT    *MQTTConfig     `yaml:"mqtt,omitempty"`
+	Cache   *CacheConfig    `yaml:"cache,omitempty"`
 }
 
 type CacheConfig struct {
@@ -102,8 +103,10 @@ type MetricConfig struct {
 	SensorNameFilter   Regexp                    `yaml:"sensor_name_filter"`
 	Help               string                    `yaml:"help"`
 	ValueType          string                    `yaml:"type"`
+	VariableLabels     map[string]string         `yaml:"variable_labels"`
 	ConstantLabels     map[string]string         `yaml:"const_labels"`
 	StringValueMapping *StringValueMappingConfig `yaml:"string_value_mapping"`
+	PromLabels         []string
 }
 
 // StringValueMappingConfig defines the mapping from string to float
@@ -113,9 +116,9 @@ type StringValueMappingConfig struct {
 	Map        map[string]float64 `yaml:"map"`
 }
 
-func (mc *MetricConfig) PrometheusDescription() *prometheus.Desc {
+func (mc *MetricConfig) PrometheusDescription(labels []string) *prometheus.Desc {
 	return prometheus.NewDesc(
-		mc.PrometheusName, mc.Help, []string{"sensor", "topic"}, mc.ConstantLabels,
+		mc.PrometheusName, mc.Help, labels, mc.ConstantLabels,
 	)
 }
 
@@ -157,5 +160,16 @@ func LoadConfig(configFile string) (Config, error) {
 	if !validRegex {
 		return Config{}, fmt.Errorf("device id regex %q does not contain required regex group %q", cfg.MQTT.DeviceIDRegex.pattern, DeviceIDRegexGroup)
 	}
+	// Preprocess ordering of variable labels
+	for _, m := range cfg.Metrics {
+		// optimization: keep these alphabetic and save a call to sort.
+		m.PromLabels = []string{"sensor", "topic"}
+
+		for pL, _ := range m.VariableLabels {
+			m.PromLabels = append(m.PromLabels, pL)
+		}
+		sort.Strings(m.PromLabels)
+	}
+
 	return cfg, nil
 }
